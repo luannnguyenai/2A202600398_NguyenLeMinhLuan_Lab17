@@ -1,0 +1,24 @@
+# Environment
+.env
+
+# Vector store
+.chroma/
+
+# Episodic log
+data/episodic_log.jsonl
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Misc
+*.egg-info/
+dist/
+build/
+.DS_Store
