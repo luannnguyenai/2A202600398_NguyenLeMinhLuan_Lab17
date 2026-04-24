@@ -1,51 +1,48 @@
-"""
-agent/graph.py — LangGraph graph definition for the Multi-Memory Agent.
-
-Graph topology:
-  START → budget_node → retrieve_node → generate_node → store_node → END
-
-Each node is a plain Python function defined in agent/nodes.py.
-"""
-
-from __future__ import annotations
-
+from typing import Any
 from langgraph.graph import StateGraph, START, END
+from langchain_core.runnables import RunnableConfig
 
-from agent.state import AgentState
-from agent.nodes import budget_node, retrieve_node, generate_node, store_node
+from agent.state import MemoryState
+from agent.nodes import (
+    classify_node,
+    retrieve_memory_node,
+    pack_context_node,
+    generate_node,
+    save_memory_node
+)
 
-
-def build_graph() -> StateGraph:
-    """
-    Construct and compile the LangGraph agent graph.
-
-    Node wiring:
-      1. budget_node   — compute available token budget for memory context
-      2. retrieve_node — query memory layers and assemble context
-      3. generate_node — call LLM with context + user message
-      4. store_node    — persist exchange to memory layers
-
-    Returns:
-        A compiled LangGraph StateGraph ready to be invoked with an
-        initial AgentState dict.
-
-    TODO:
-        - Add conditional edges for memory routing (optional optimisation).
-        - Add error-handling / retry edges if generate_node fails.
-    """
-    builder = StateGraph(AgentState)
-
-    # Register nodes
-    builder.add_node("budget_node", budget_node)
-    builder.add_node("retrieve_node", retrieve_node)
-    builder.add_node("generate_node", generate_node)
-    builder.add_node("store_node", store_node)
-
-    # Wire edges: linear pipeline
-    builder.add_edge(START, "budget_node")
-    builder.add_edge("budget_node", "retrieve_node")
-    builder.add_edge("retrieve_node", "generate_node")
-    builder.add_edge("generate_node", "store_node")
-    builder.add_edge("store_node", END)
-
+def build_graph(memories: dict[str, Any]):
+    builder = StateGraph(MemoryState)
+    
+    builder.add_node("classify", classify_node)
+    builder.add_node("retrieve", retrieve_memory_node)
+    builder.add_node("pack", pack_context_node)
+    builder.add_node("generate", generate_node)
+    builder.add_node("save", save_memory_node)
+    
+    builder.add_edge(START, "classify")
+    builder.add_edge("classify", "retrieve")
+    builder.add_edge("retrieve", "pack")
+    builder.add_edge("pack", "generate")
+    builder.add_edge("generate", "save")
+    builder.add_edge("save", END)
+    
     return builder.compile()
+
+async def invoke_turn(graph, memories: dict[str, Any], user_id: str, text: str):
+    state = {
+        "user_id": user_id,
+        "user_input": text,
+        "messages": [],
+        "user_profile": {},
+        "episodes": [],
+        "semantic_hits": [],
+        "memory_budget": memories["budget"].max_tokens,
+        "intent": "",
+        "retrieved_from": [],
+        "response": "",
+        "debug": {}
+    }
+    
+    config = RunnableConfig(configurable={"memories": memories})
+    return await graph.ainvoke(state, config=config)

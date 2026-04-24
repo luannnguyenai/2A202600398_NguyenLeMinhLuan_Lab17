@@ -1,181 +1,180 @@
-"""
-agent/nodes.py — LangGraph node functions.
-
-Each function takes an AgentState and returns a partial AgentState dict
-with the fields it modifies. LangGraph merges the returned dict into the
-running state automatically.
-
-Node execution order (defined in graph.py):
-  budget_node → retrieve_node → generate_node → store_node
-"""
-
-from __future__ import annotations
-
+import json
 import os
 from typing import Any
 
-from agent.state import AgentState
-from agent.router import route_memory_layers, should_store_to_long_term
-from memory.budget import MemoryBudgetManager
-from memory.short_term import ShortTermMemory
-from memory.long_term import LongTermMemory
-from memory.episodic import EpisodicMemory
-from memory.semantic import SemanticMemory
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
+from langchain_core.runnables import RunnableConfig
 
-# ---------------------------------------------------------------------------
-# Lazy singletons — initialised on first use to avoid import-time side effects
-# ---------------------------------------------------------------------------
+from agent.state import MemoryState
+from agent.router import classify_intent
+from agent.prompt import build_prompt
+from memory.budget import ContextBudget, Chunk, Priority
 
-_short_term: ShortTermMemory | None = None
-_long_term: LongTermMemory | None = None
-_episodic: EpisodicMemory | None = None
-_semantic: SemanticMemory | None = None
-_budget_manager: MemoryBudgetManager | None = None
+async def classify_node(state: MemoryState, config: RunnableConfig) -> dict[str, Any]:
+    intent = classify_intent(state["user_input"])
+    return {"intent": intent}
 
+async def retrieve_memory_node(state: MemoryState, config: RunnableConfig) -> dict[str, Any]:
+    intent = state.get("intent", "chitchat")
+    memories = config["configurable"]["memories"]
+    
+    st = memories["short_term"]
+    lt = memories["long_term"]
+    ep = memories["episodic"]
+    sem = memories["semantic"]
+    
+    user_id = state["user_id"]
+    query = state["user_input"]
+    
+    # Always fetch short term
+    st_res = await st.retrieve(query, top_k=None)
+    messages = [res["metadata"] for res in st_res]
+    
+    profile_dict = {}
+    episodes_list = []
+    semantic_list = []
+    retrieved_from = ["short_term"]
+    
+    if intent == "preference":
+        lt_res = await lt.retrieve(query, top_k=5, user_id=user_id)
+        for r in lt_res:
+            profile_dict[r["metadata"]["fact_key"]] = r["content"].split(": ", 1)[1] if ": " in r["content"] else r["content"]
+        retrieved_from.append("long_term")
+    elif intent == "experience":
+        ep_res = await ep.retrieve(query, top_k=3, user_id=user_id)
+        episodes_list = ep_res
+        retrieved_from.append("episodic")
+    elif intent == "factual":
+        sem_res = await sem.retrieve(query, top_k=4)
+        semantic_list = sem_res
+        retrieved_from.append("semantic")
+        
+    return {
+        "messages": messages,
+        "user_profile": profile_dict,
+        "episodes": episodes_list,
+        "semantic_hits": semantic_list,
+        "retrieved_from": retrieved_from
+    }
 
-def _get_memories() -> tuple[
-    ShortTermMemory, LongTermMemory, EpisodicMemory, SemanticMemory, MemoryBudgetManager
-]:
-    """Initialise and return memory layer singletons."""
-    global _short_term, _long_term, _episodic, _semantic, _budget_manager
-    if _short_term is None:
-        _short_term = ShortTermMemory()
-        _long_term = LongTermMemory()
-        _episodic = EpisodicMemory()
-        _semantic = SemanticMemory()
-        _budget_manager = MemoryBudgetManager(
-            max_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", "4000"))
+async def pack_context_node(state: MemoryState, config: RunnableConfig) -> dict[str, Any]:
+    memories = config["configurable"]["memories"]
+    budget: ContextBudget = memories["budget"]
+    
+    chunks = []
+    chunks.append(Chunk(content="SYSTEM", priority=Priority.L1_SYSTEM, tokens=100, score=1.0))
+    
+    for k, v in state.get("user_profile", {}).items():
+        text = f"{k}: {v}"
+        chunks.append(Chunk(content=text, priority=Priority.L2_PROFILE, tokens=budget.count_tokens(text), score=1.0, source=k))
+        
+    for ep in state.get("episodes", []):
+        text = ep["content"]
+        chunks.append(Chunk(content=text, priority=Priority.L3_RETRIEVAL, tokens=budget.count_tokens(text), score=ep["score"], source=ep["metadata"]["id"]))
+        
+    for sh in state.get("semantic_hits", []):
+        text = sh["content"]
+        chunks.append(Chunk(content=text, priority=Priority.L3_RETRIEVAL, tokens=budget.count_tokens(text), score=sh["score"], source=sh["metadata"].get("doc_id", "")))
+        
+    for msg in state.get("messages", []):
+        text = f"{msg['role']}: {msg['content']}"
+        chunks.append(Chunk(content=text, priority=Priority.L4_SHORT_TERM, tokens=budget.count_tokens(text), score=1.0, source=text))
+        
+    packed = budget.pack(chunks)
+    stats = budget.last_pack_stats()
+    
+    new_profile = {}
+    new_episodes = []
+    new_semantic = []
+    new_messages = []
+    
+    for c in packed:
+        if c.priority == Priority.L2_PROFILE:
+            new_profile[c.source] = state["user_profile"][c.source]
+        elif c.priority == Priority.L3_RETRIEVAL:
+            if c.source.startswith("ep_"):
+                for ep in state.get("episodes", []):
+                    if ep["metadata"]["id"] == c.source:
+                        new_episodes.append(ep)
+                        break
+            else:
+                for sh in state.get("semantic_hits", []):
+                    if sh["metadata"].get("doc_id") == c.source:
+                        new_semantic.append(sh)
+                        break
+        elif c.priority == Priority.L4_SHORT_TERM:
+            for msg in state.get("messages", []):
+                if f"{msg['role']}: {msg['content']}" == c.source:
+                    new_messages.append(msg)
+                    break
+                    
+    final_messages = [m for m in state.get("messages", []) if m in new_messages]
+
+    debug = state.get("debug", {})
+    debug["budget_stats"] = stats
+
+    return {
+        "user_profile": new_profile,
+        "episodes": new_episodes,
+        "semantic_hits": new_semantic,
+        "messages": final_messages,
+        "debug": debug
+    }
+
+async def generate_node(state: MemoryState, config: RunnableConfig) -> dict[str, Any]:
+    prompt_msgs = build_prompt(state)
+    llm = ChatOpenAI(model=os.getenv("MODEL", "gpt-4o-mini"), temperature=0.7)
+    
+    msgs = []
+    for m in prompt_msgs:
+        if m["role"] == "system":
+            msgs.append(SystemMessage(content=m["content"]))
+        else:
+            msgs.append(HumanMessage(content=m["content"]))
+            
+    resp = await llm.ainvoke(msgs)
+    return {"response": str(resp.content)}
+
+async def save_memory_node(state: MemoryState, config: RunnableConfig) -> dict[str, Any]:
+    memories = config["configurable"]["memories"]
+    intent = state.get("intent")
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    response = state["response"]
+    
+    st = memories["short_term"]
+    await st.save("user", user_input)
+    await st.save("assistant", response)
+    
+    if intent == "preference":
+        try:
+            llm = ChatOpenAI(model=os.getenv("MODEL", "gpt-4o-mini"), temperature=0.0)
+            sys_msg = SystemMessage(
+                content='Extract preference facts about the user. Output JSON schema: {"facts": [{"key": "...", "value": "..."}]}'
+            )
+            hum_msg = HumanMessage(content=user_input)
+            ext_resp = await llm.ainvoke([sys_msg, hum_msg], response_format={"type": "json_object"})
+            data = json.loads(str(ext_resp.content))
+            facts = data.get("facts", [])
+            lt = memories["long_term"]
+            for f in facts:
+                await lt.save(f"{user_id}/{f['key']}", f["value"], metadata={"source": user_input})
+        except Exception as e:
+            pass
+            
+    if intent == "experience":
+        ep = memories["episodic"]
+        await ep.save(
+            user_id,
+            {
+                "task": user_input,
+                "outcome": "success",
+                "summary": response,
+                "lesson": "None",
+                "tags": ["experience"]
+            }
         )
-    return _short_term, _long_term, _episodic, _semantic, _budget_manager  # type: ignore[return-value]
-
-
-# ---------------------------------------------------------------------------
-# Node: budget_node
-# ---------------------------------------------------------------------------
-
-
-def budget_node(state: AgentState) -> dict[str, Any]:
-    """
-    Calculate available token budget for memory context.
-
-    Reads MAX_CONTEXT_TOKENS from environment, subtracts estimated tokens
-    used by system prompt and user message, and writes the remainder to
-    state.memory_budget.
-
-    Args:
-        state: Current AgentState.
-
-    Returns:
-        Dict with key "memory_budget" (int).
-
-    TODO:
-        - Use tiktoken to count tokens in user_message + system prompt.
-        - Subtract from MAX_CONTEXT_TOKENS.
-        - Write result to state["memory_budget"].
-    """
-    _, _, _, _, budget_manager = _get_memories()
-    # TODO: implement actual token counting
-    budget = budget_manager.compute_budget(
-        user_message=state["user_message"],
-        system_overhead=500,  # rough estimate
-    )
-    return {"memory_budget": budget}
-
-
-# ---------------------------------------------------------------------------
-# Node: retrieve_node
-# ---------------------------------------------------------------------------
-
-
-def retrieve_node(state: AgentState) -> dict[str, Any]:
-    """
-    Query memory layers and assemble context string.
-
-    Uses router.route_memory_layers() to decide which layers to query,
-    then fetches results from each, truncates to memory_budget tokens,
-    and assembles into state.context.
-
-    Args:
-        state: Current AgentState with user_message and memory_budget.
-
-    Returns:
-        Dict with keys "context" (str) and "retrieved_from" (list[str]).
-
-    TODO:
-        - Call route_memory_layers(state) to get target layers.
-        - Query each layer: short_term.get(), long_term.search(),
-          episodic.recall(), semantic.query().
-        - Concatenate results, respecting memory_budget.
-        - Populate retrieved_from with layer names that returned content.
-    """
-    short_term, long_term, episodic, semantic, _ = _get_memories()
-    layers = route_memory_layers(state)
-
-    context_parts: list[str] = []
-    retrieved_from: list[str] = []
-
-    # TODO: implement actual retrieval per layer
-    for layer in layers:
-        pass  # placeholder
-
-    context = "\n\n".join(context_parts) if context_parts else "(no memory context)"
-    return {"context": context, "retrieved_from": retrieved_from}
-
-
-# ---------------------------------------------------------------------------
-# Node: generate_node
-# ---------------------------------------------------------------------------
-
-
-def generate_node(state: AgentState) -> dict[str, Any]:
-    """
-    Generate the agent's response using the LLM.
-
-    Combines the assembled context with the user message via CHAT_PROMPT
-    and calls the configured ChatOpenAI model.
-
-    Args:
-        state: Current AgentState with context and user_message.
-
-    Returns:
-        Dict with key "response" (str).
-
-    TODO:
-        - Import CHAT_PROMPT from agent.prompt.
-        - Instantiate ChatOpenAI(model=os.getenv("MODEL", "gpt-4o-mini")).
-        - Format prompt with context and user_message.
-        - Invoke LLM and extract .content from the result.
-    """
-    # Stub: echo the user message
-    return {"response": f"[STUB] Echo: {state['user_message']}"}
-
-
-# ---------------------------------------------------------------------------
-# Node: store_node
-# ---------------------------------------------------------------------------
-
-
-def store_node(state: AgentState) -> dict[str, Any]:
-    """
-    Persist the current exchange to appropriate memory layers.
-
-    Writes to:
-      - short_term: always (sliding window of recent turns)
-      - long_term:  if should_store_to_long_term(state) is True
-      - episodic:   always (full interaction log)
-
-    Args:
-        state: Completed AgentState after generate_node has run.
-
-    Returns:
-        Empty dict (no state fields modified).
-
-    TODO:
-        - Call short_term.add(session_id, user_message, response).
-        - Conditionally call long_term.add(user_message, response).
-        - Call episodic.log(session_id, turn, user_message, response).
-    """
-    short_term, long_term, episodic, _, _ = _get_memories()
-    # TODO: implement storage calls
+        
     return {}
