@@ -152,15 +152,22 @@ async def save_memory_node(state: MemoryState, config: RunnableConfig) -> dict[s
         try:
             llm = ChatOpenAI(model=os.getenv("MODEL", "gpt-4o-mini"), temperature=0.0)
             sys_msg = SystemMessage(
-                content='Extract preference facts about the user. Output JSON schema: {"facts": [{"key": "...", "value": "..."}]}'
+                content='''Trích xuất các fact cá nhân dạng {key, value} từ câu user.
+Nếu user SỬA/ĐÍNH CHÍNH fact cũ (từ khóa 'À nhầm', 'không phải', 'thực ra'), vẫn trả fact MỚI với cùng key — LongTermProfileMemory sẽ tự overwrite.
+Chỉ sử dụng các key sau (snake_case, lowercase): name, age, gender, occupation, location, allergy, diet, language, hobby, preference.
+Trả JSON {"facts": [{"key": "...", "value": "..."}]} hoặc {"facts": []}.'''
             )
             hum_msg = HumanMessage(content=user_input)
             ext_resp = await llm.ainvoke([sys_msg, hum_msg], response_format={"type": "json_object"})
             data = json.loads(str(ext_resp.content))
             facts = data.get("facts", [])
             lt = memories["long_term"]
+            valid_keys = {"name", "age", "gender", "occupation", "location", "allergy", "diet", "language", "hobby", "preference"}
             for f in facts:
-                await lt.save(f"{user_id}/{f['key']}", f["value"], metadata={"source": user_input})
+                k = str(f.get("key", "")).lower().strip()
+                v = str(f.get("value", "")).strip()
+                if k in valid_keys and v:
+                    await lt.save(f"{user_id}/{k}", v, metadata={"source": user_input})
         except Exception as e:
             pass
             
