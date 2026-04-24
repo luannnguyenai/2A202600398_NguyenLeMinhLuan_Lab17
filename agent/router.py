@@ -23,8 +23,11 @@ def classify_intent(user_input: str) -> Literal["preference", "factual", "experi
     try:
         llm = ChatOpenAI(model=os.getenv("MODEL", "gpt-4o-mini"), temperature=0.0)
         sys_msg = SystemMessage(
-            content='You are an intent classifier. Classify the user input into exactly one of: '
-                    '"preference", "factual", "experience", "chitchat".\n'
+            content='You are an intent classifier. Classify the user input into exactly one of:\n'
+                    '- "preference": questions or statements about the user\'s name, personal details, likes/dislikes, diet, allergy, or occupation.\n'
+                    '- "factual": general knowledge questions, definitions, or asking how things work (e.g. Docker, LangGraph).\n'
+                    '- "experience": statements or questions about past actions, past errors, lessons learned, or debugging history.\n'
+                    '- "chitchat": general conversational filler, greetings, or off-topic chat.\n'
                     'Output JSON matching schema: {"intent": "...", "reason": "..."}'
         )
         hum_msg = HumanMessage(content=user_input)

@@ -7,6 +7,9 @@ import json
 import os
 import shutil
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from rich.console import Console
 from rich.table import Table
@@ -120,12 +123,12 @@ from pathlib import Path
 from memory.semantic import SemanticMemory
 async def ingest_test_corpus():
     Path("data/corpus").mkdir(parents=True, exist_ok=True)
-    Path("data/corpus/faq_docker.md").write_text("connect container using service name as hostname")
-    Path("data/corpus/faq_langgraph.md").write_text("StateGraph is the core class for multi-actor apps")
+    Path("data/corpus/faq_docker.md").write_text("sử dụng service name thay vì localhost làm hostname")
+    Path("data/corpus/faq_langgraph.md").write_text("StateGraph là core class cho các ứng dụng multi-actor")
     mem = SemanticMemory()
     docs = [
-        {"id": "doc1", "text": "connect container using service name as hostname", "source": "faq_docker.md"},
-        {"id": "doc2", "text": "StateGraph is the core class for multi-actor apps", "source": "faq_langgraph.md"}
+        {"id": "doc1", "text": "kết nối container bằng cách dùng service name làm hostname", "source": "faq_docker.md"},
+        {"id": "doc2", "text": "StateGraph là core class cho các ứng dụng multi-actor", "source": "faq_langgraph.md"}
     ]
     await mem.ingest(docs)
     ''')
