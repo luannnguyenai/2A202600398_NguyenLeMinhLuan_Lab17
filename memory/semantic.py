@@ -1,147 +1,206 @@
 """
-memory/semantic.py — Semantic Memory as an in-memory knowledge graph.
-
-Semantic memory stores structured facts as (subject, predicate, object)
-triples in a directed graph. It supports querying by subject or object
-and reasoning over chains of relationships.
-
-This implementation uses a plain Python dict-of-dicts adjacency list.
-For production use, consider replacing with NetworkX or a graph database.
+memory/semantic.py — Semantic Memory using ChromaDB or fallback keyword search.
 """
-
 from __future__ import annotations
 
-from collections import defaultdict
+import logging
+from pathlib import Path
 from typing import Any
 
-from memory.base import BaseMemory
+from memory.base import BaseMemory, RetrieveResult
 
+logger = logging.getLogger(__name__)
 
-# Type alias for a triple
-Triple = tuple[str, str, str]  # (subject, predicate, object)
+try:
+    import chromadb
+    from langchain_openai import OpenAIEmbeddings
+    HAS_CHROMA = True
+except ImportError:
+    HAS_CHROMA = False
 
+def _tokenize(text: str) -> set[str]:
+    """Simple tokenizer for fallback keyword search."""
+    return {
+        w.strip(".,;:!?\"'()[]{}").lower() 
+        for w in text.split() 
+        if len(w.strip(".,;:!?\"'()[]{}")) >= 2
+    }
 
 class SemanticMemory(BaseMemory):
     """
-    Semantic Memory layer using an in-memory directed knowledge graph.
-
-    Graph structure:
-        _graph[subject][predicate] = list[object]
-
-    Attributes:
-        _graph: Adjacency dict storing (subject → predicate → [object]).
-        _triples: Flat list of all stored triples for iteration.
+    Semantic Memory — stores documents using vector embeddings (ChromaDB) 
+    or falls back to keyword matching if dependencies are missing.
     """
+    SOURCE = "semantic"
 
-    def __init__(self) -> None:
-        """Initialise an empty knowledge graph."""
-        self._graph: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-        self._triples: list[Triple] = []
-
-    # ------------------------------------------------------------------
-    # BaseMemory interface
-    # ------------------------------------------------------------------
-
-    def add(
+    def __init__(
         self,
-        subject: str,
-        predicate: str,
-        obj: str,
-        **kwargs: Any,
+        persist_path: str = ".chroma",
+        collection: str = "lab17",
+        embedding_model: str = "text-embedding-3-small"
     ) -> None:
+        self.persist_path = persist_path
+        self.collection_name = collection
+        self.embedding_model = embedding_model
+        
+        self._backend = "chroma" if HAS_CHROMA else "keyword"
+        self._client = None
+        self._collection = None
+        self._embeddings = None
+        
+        self._fallback_docs: list[dict[str, Any]] = []
+        self._ready = False
+
+        logger.info(f"[SemanticMemory] Backend: {self._backend}")
+
+    async def _ensure_ready(self) -> None:
+        if self._ready:
+            return
+
+        if self._backend == "chroma":
+            if self._client is None:
+                self._client = chromadb.PersistentClient(path=self.persist_path)
+                self._embeddings = OpenAIEmbeddings(model=self.embedding_model)
+                self._collection = self._client.get_or_create_collection(
+                    name=self.collection_name
+                )
+        else:
+            self._load_fallback_corpus()
+            
+        self._ready = True
+
+    def _load_fallback_corpus(self) -> None:
+        corpus_dir = Path("data/corpus")
+        if not corpus_dir.exists():
+            return
+        
+        for p in corpus_dir.glob("*.*"):
+            if p.suffix in (".md", ".txt"):
+                content = p.read_text(encoding="utf-8")
+                self._fallback_docs.append({
+                    "id": p.name,
+                    "text": content,
+                    "source": p.name
+                })
+
+    async def ingest(self, docs: list[dict[str, Any]], force: bool = False) -> None:
         """
-        Add a (subject, predicate, object) triple to the knowledge graph.
-
-        Args:
-            subject:   The subject entity (e.g. "Alice").
-            predicate: The relationship (e.g. "works_at").
-            obj:       The object entity (e.g. "OpenAI").
-
-        TODO:
-            - Avoid duplicate triples.
-            - Optionally normalise strings (lowercase, strip).
+        Ingest documents. 
+        docs format: [{"id": str, "text": str, "source": str}]
         """
-        # TODO: implement deduplication
-        self._graph[subject][predicate].append(obj)
-        self._triples.append((subject, predicate, obj))
+        await self._ensure_ready()
+        
+        if not docs:
+            return
 
-    def search(self, query: str, k: int = 5, **kwargs: Any) -> list[str]:
+        if self._backend == "chroma":
+            existing = self._collection.get(include=["metadatas"])
+            existing_ids = set(existing["ids"])
+            
+            to_add = []
+            for d in docs:
+                if force or d["id"] not in existing_ids:
+                    to_add.append(d)
+            
+            if to_add:
+                texts = [d["text"] for d in to_add]
+                metadatas = [{"source": d.get("source", "unknown")} for d in to_add]
+                ids = [d["id"] for d in to_add]
+                
+                embeddings = await self._embeddings.aembed_documents(texts)
+                
+                self._collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=texts,
+                    metadatas=metadatas
+                )
+        else:
+            existing_ids = {d["id"] for d in self._fallback_docs}
+            for d in docs:
+                if force or d["id"] not in existing_ids:
+                    self._fallback_docs.append({
+                        "id": d["id"],
+                        "text": d["text"],
+                        "source": d.get("source", "unknown")
+                    })
+
+    async def save(self, key: str, value: Any, metadata: dict | None = None) -> None:
+        """BaseMemory compat."""
+        source = (metadata or {}).get("source", "unknown")
+        await self.ingest([{"id": key, "text": str(value), "source": source}])
+
+    async def retrieve(self, query: str, top_k: int = 4) -> list[RetrieveResult]:
         """
-        Find triples where the subject or object matches the query.
-
-        Args:
-            query: Entity name to search for (exact or substring match).
-            k:     Max number of results.
-
-        Returns:
-            List of formatted triple strings, e.g. ["Alice works_at OpenAI"].
-
-        TODO:
-            - Implement substring / fuzzy matching.
-            - Support multi-hop reasoning (optional).
+        Retrieve relevant documents.
+        Returns: list[{"content": text, "score": 1-distance, "source": meta.source, "metadata": {"doc_id": id}}]
         """
-        # TODO: implement
-        results = []
-        for subj, pred, obj in self._triples:
-            if query.lower() in subj.lower() or query.lower() in obj.lower():
-                results.append(f"{subj} {pred} {obj}")
-                if len(results) >= k:
-                    break
-        return results
+        await self._ensure_ready()
+        
+        if self._backend == "chroma":
+            query_embedding = await self._embeddings.aembed_query(query)
+            results = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            ret_results = []
+            if results and results["documents"] and results["documents"][0]:
+                docs = results["documents"][0]
+                metas = results["metadatas"][0]
+                dists = results["distances"][0]
+                ids = results["ids"][0]
+                
+                for i in range(len(docs)):
+                    # dist is typically L2 or cosine distance.
+                    # Normalized to [0, 1] loosely for scoring
+                    score = max(0.0, 1.0 - (dists[i] / 2.0))
+                    ret_results.append(
+                        self._make_result(
+                            content=docs[i],
+                            score=score,
+                            source=metas[i].get("source", "unknown"),
+                            metadata={"doc_id": ids[i]}
+                        )
+                    )
+            return ret_results
+        else:
+            query_tokens = _tokenize(query)
+            if not query_tokens:
+                return []
+                
+            scored = []
+            for doc in self._fallback_docs:
+                doc_tokens = _tokenize(doc["text"])
+                overlap = len(query_tokens & doc_tokens)
+                if overlap > 0:
+                    score = min(1.0, overlap / len(query_tokens))
+                    scored.append((score, doc))
+            
+            scored.sort(key=lambda x: x[0], reverse=True)
+            
+            ret_results = []
+            for score, doc in scored[:top_k]:
+                ret_results.append(
+                    self._make_result(
+                        content=doc["text"],
+                        score=score,
+                        source=doc.get("source", "unknown"),
+                        metadata={"doc_id": doc["id"]}
+                    )
+                )
+            return ret_results
 
-    def query(self, subject: str) -> list[str]:
-        """
-        Return all facts about a given subject entity.
-
-        Args:
-            subject: The entity to look up.
-
-        Returns:
-            List of strings like "predicate: object".
-
-        TODO:
-            - Look up self._graph[subject] and format output.
-        """
-        # TODO: implement proper formatting
-        if subject not in self._graph:
-            return []
-        facts = []
-        for pred, objects in self._graph[subject].items():
-            for obj in objects:
-                facts.append(f"{pred}: {obj}")
-        return facts
-
-    def clear(self, **kwargs: Any) -> None:
-        """
-        Clear all triples from the knowledge graph.
-
-        TODO:
-            - Reset self._graph and self._triples.
-        """
-        self._graph.clear()
-        self._triples.clear()
-
-    # ------------------------------------------------------------------
-    # Graph utilities
-    # ------------------------------------------------------------------
-
-    def load_from_file(self, filepath: str) -> None:
-        """
-        Load triples from a TSV or JSON file into the graph.
-
-        Expected TSV format: subject\\tpredicate\\tobject (one triple per line).
-
-        Args:
-            filepath: Path to the input file.
-
-        TODO:
-            - Detect format (tsv / json) by file extension.
-            - Parse and call self.add() for each triple.
-        """
-        # TODO: implement
-        pass
-
-    @property
-    def triple_count(self) -> int:
-        """Return the total number of stored triples."""
-        return len(self._triples)
+    async def clear(self, key: str | None = None) -> None:
+        """Drop collection or clear fallback docs."""
+        await self._ensure_ready()
+        if self._backend == "chroma":
+            if self._client and self.collection_name:
+                try:
+                    self._client.delete_collection(self.collection_name)
+                    self._collection = self._client.get_or_create_collection(name=self.collection_name)
+                except Exception:
+                    pass
+        else:
+            self._fallback_docs.clear()
