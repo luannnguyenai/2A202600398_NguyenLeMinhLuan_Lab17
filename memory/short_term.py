@@ -1,136 +1,274 @@
 """
-memory/short_term.py — Short-Term Memory backed by Redis.
+memory/short_term.py — Short-Term Memory: async sliding-window buffer.
 
-Short-term memory stores the most recent N conversation turns for a
-session using a Redis list. It acts as a sliding-window context buffer.
+Stores the most recent conversation turns in memory as a plain Python list.
+Eviction (FIFO) is triggered when either:
+  - The number of stored turns exceeds `max_turns`, OR
+  - The cumulative token count exceeds `max_tokens`.
 
-Storage schema (Redis):
-    Key   : f"stm:{session_id}"
-    Type  : Redis List (RPUSH / LTRIM)
-    Value : JSON-serialised {"role": str, "content": str}
+Token counting uses tiktoken (cl100k_base encoding); if tiktoken is not
+installed the implementation falls back to a simple whitespace word count
+(1 word ≈ 1 token, conservative approximation).
+
+Retrieve result shape (inherited from BaseMemory):
+    {"content": str, "score": float, "source": "short_term", "metadata": dict}
+
+Where:
+    content  = "{role}: {content}" formatted string
+    score    = normalised recency score in (0.0, 1.0] (most recent = 1.0)
+    metadata = {"role": str, "ts": float, "tokens": int}
 """
 
 from __future__ import annotations
 
-import json
-import os
+import time
 from typing import Any
 
-from memory.base import BaseMemory
+from memory.base import BaseMemory, RetrieveResult
 
+# ---------------------------------------------------------------------------
+# Optional tiktoken import with graceful fallback
+# ---------------------------------------------------------------------------
+
+try:
+    import tiktoken
+
+    _ENCODING = tiktoken.get_encoding("cl100k_base")
+
+    def _count_tokens(text: str) -> int:
+        """Count tokens using tiktoken cl100k_base encoding."""
+        return len(_ENCODING.encode(text))
+
+except ImportError:  # pragma: no cover
+    _ENCODING = None  # type: ignore[assignment]
+
+    def _count_tokens(text: str) -> int:  # type: ignore[misc]
+        """Fallback: count whitespace-separated words as token approximation."""
+        return max(1, len(text.split()))
+
+
+# ---------------------------------------------------------------------------
+# Turn entry shape (internal)
+# ---------------------------------------------------------------------------
+
+class _Turn:
+    """Internal representation of a single conversation turn."""
+
+    __slots__ = ("role", "content", "ts", "tokens")
+
+    def __init__(self, role: str, content: str, ts: float | None = None) -> None:
+        if role not in ("user", "assistant", "system"):
+            raise ValueError(f"Invalid role '{role}'. Must be 'user', 'assistant', or 'system'.")
+        self.role: str = role
+        self.content: str = content
+        self.ts: float = ts if ts is not None else time.time()
+        self.tokens: int = _count_tokens(content)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain dict representation."""
+        return {
+            "role": self.role,
+            "content": self.content,
+            "ts": self.ts,
+            "tokens": self.tokens,
+        }
+
+
+# ---------------------------------------------------------------------------
+# ShortTermMemory
+# ---------------------------------------------------------------------------
 
 class ShortTermMemory(BaseMemory):
     """
-    Short-Term Memory layer using Redis as the backing store.
+    Short-Term Memory: in-process async sliding-window conversation buffer.
+
+    The buffer holds at most `max_turns` turns and at most `max_tokens`
+    cumulative tokens. Whenever a new turn is appended and either limit is
+    exceeded, the oldest turn(s) are evicted (FIFO) until both constraints
+    are satisfied.
 
     Attributes:
-        redis_url:   Redis connection URL from env REDIS_URL.
-        window_size: Maximum number of messages to retain per session.
-        _client:     Lazy-initialised Redis client.
+        max_turns:     Maximum number of turns to retain.
+        max_tokens:    Maximum cumulative token count across all turns.
+        _buffer:       Ordered list of _Turn objects (oldest first).
+        _total_tokens: Running token count for O(1) budget checks.
     """
 
-    def __init__(
-        self,
-        redis_url: str | None = None,
-        window_size: int = 10,
-    ) -> None:
+    SOURCE = "short_term"
+
+    def __init__(self, max_turns: int = 10, max_tokens: int = 1500) -> None:
         """
         Initialise ShortTermMemory.
 
         Args:
-            redis_url:   Redis URL. Defaults to REDIS_URL env var.
-            window_size: Max messages to retain (older ones are evicted).
+            max_turns:  Maximum number of turns to retain (default 10).
+            max_tokens: Maximum cumulative token count (default 1500).
         """
-        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        self.window_size = window_size
-        self._client = None  # Lazy-initialised
+        if max_turns < 1:
+            raise ValueError("max_turns must be >= 1")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        self.max_turns: int = max_turns
+        self.max_tokens: int = max_tokens
+        self._buffer: list[_Turn] = []
+        self._total_tokens: int = 0
 
-    def _get_client(self):
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _evict_if_needed(self) -> None:
         """
-        Return (and lazily create) the Redis client.
+        Remove the oldest turn(s) until both limits are satisfied.
 
-        TODO:
-            - Import redis and call redis.from_url(self.redis_url).
-            - Cache in self._client.
+        Runs in O(k) where k is the number of turns evicted (usually 1).
+        Called immediately after appending a new turn.
         """
-        if self._client is None:
-            # TODO: initialise redis client
-            pass
-        return self._client
+        while self._buffer and (
+            len(self._buffer) > self.max_turns
+            or self._total_tokens > self.max_tokens
+        ):
+            oldest = self._buffer.pop(0)
+            self._total_tokens -= oldest.tokens
 
-    def _make_key(self, session_id: str) -> str:
-        """Return the Redis key for a given session."""
-        return f"stm:{session_id}"
+    # ------------------------------------------------------------------ #
+    # BaseMemory interface                                                  #
+    # ------------------------------------------------------------------ #
 
-    # ------------------------------------------------------------------
-    # BaseMemory interface
-    # ------------------------------------------------------------------
-
-    def add(self, session_id: str, role: str, content: str) -> None:
+    async def save(
+        self,
+        key: str,
+        value: Any,
+        metadata: dict | None = None,
+    ) -> None:
         """
-        Append a message to the session's short-term memory list.
-
-        Keeps only the latest `window_size` messages (sliding window).
+        Append a new turn to the sliding-window buffer.
 
         Args:
-            session_id: Conversation session identifier.
-            role:       "user" or "assistant".
-            content:    Message text.
+            key:      Role of the speaker: ``"user"``, ``"assistant"``,
+                      or ``"system"``. (The `key` parameter maps to *role*
+                      to stay consistent with the BaseMemory interface.)
+            value:    Message content string.
+            metadata: Optional extra fields; currently unused by this layer
+                      but accepted for interface compatibility.
 
-        TODO:
-            - Serialise to JSON and RPUSH to Redis key.
-            - LTRIM to window_size * 2 (user + assistant pairs).
-        """
-        # TODO: implement
-        pass
+        Raises:
+            ValueError: If `key` is not a recognised role.
 
-    def search(self, query: str, session_id: str = "", **kwargs: Any) -> list[str]:
+        Example::
+
+            await stm.save("user", "Hello, I'm Alice.")
+            await stm.save("assistant", "Hi Alice! How can I help?")
         """
-        Return all messages in the session window (no semantic search).
+        role = str(key)
+        content = str(value)
+        ts = (metadata or {}).get("ts", None)
+
+        turn = _Turn(role=role, content=content, ts=ts)
+        self._buffer.append(turn)
+        self._total_tokens += turn.tokens
+        self._evict_if_needed()
+
+    async def retrieve(
+        self,
+        query: str,
+        top_k: int | None = 5,  # type: ignore[override]
+    ) -> list[RetrieveResult]:
+        """
+        Return the most recent turns from the buffer.
+
+        No semantic ranking is performed — short-term memory is ordered by
+        recency only. The most recent turn receives score ``1.0``; earlier
+        turns receive linearly decreasing scores.
 
         Args:
-            query:      Ignored for short-term memory (returns full window).
-            session_id: Session to retrieve messages from.
+            query: Ignored (short-term memory is position-based, not semantic).
+                   Kept for interface compatibility.
+            top_k: Number of most-recent turns to return.
+                   Pass ``None`` (or omit) to return all buffered turns.
 
         Returns:
-            List of formatted strings, e.g. ["user: Hi", "assistant: Hello"].
+            List of RetrieveResult dicts ordered oldest → newest.
+            (Scores are assigned newest → highest so callers can rank if needed.)
 
-        TODO:
-            - LRANGE key 0 -1 from Redis.
-            - Deserialise JSON and format as "{role}: {content}".
-        """
-        # TODO: implement
-        return []
+        Example::
 
-    def get(self, session_id: str) -> list[dict[str, str]]:
+            results = await stm.retrieve("", top_k=None)
+            # → [{"content": "user: Hello", "score": 0.5, ...}, ...]
         """
-        Return raw message dicts for a session.
+        if not self._buffer:
+            return []
+
+        # Decide how many turns to return
+        n = len(self._buffer) if top_k is None else min(top_k, len(self._buffer))
+        window = self._buffer[-n:]  # oldest-first slice of the last n turns
+
+        total = len(window)
+        results: list[RetrieveResult] = []
+        for idx, turn in enumerate(window):
+            # Recency score: oldest gets 1/total, newest gets 1.0
+            score = (idx + 1) / total
+            results.append(
+                self._make_result(
+                    content=f"{turn.role}: {turn.content}",
+                    score=round(score, 4),
+                    source=self.SOURCE,
+                    metadata=turn.to_dict(),
+                )
+            )
+        return results
+
+    async def clear(self, key: str | None = None) -> None:
+        """
+        Clear the buffer.
 
         Args:
-            session_id: Session to retrieve.
+            key: Ignored — short-term memory is not keyed by session in this
+                 in-process implementation (callers maintain one instance per
+                 session). Accepted for interface compatibility.
+        """
+        self._buffer.clear()
+        self._total_tokens = 0
+
+    # ------------------------------------------------------------------ #
+    # Extra helpers                                                        #
+    # ------------------------------------------------------------------ #
+
+    def to_messages(self) -> list[dict[str, str]]:
+        """
+        Return the buffer as a list of OpenAI-style message dicts.
+
+        Suitable for direct injection into ``ChatPromptTemplate`` or the
+        ``messages`` parameter of ``ChatOpenAI``.
 
         Returns:
-            List of {"role": str, "content": str} dicts.
+            List of ``{"role": str, "content": str}`` dicts, oldest first.
 
-        TODO:
-            - LRANGE and deserialise.
+        Example::
+
+            messages = stm.to_messages()
+            # → [{"role": "user", "content": "Hello"}, ...]
         """
-        # TODO: implement
-        return []
+        return [{"role": t.role, "content": t.content} for t in self._buffer]
 
-    def clear(self, session_id: str = "", **kwargs: Any) -> None:
-        """
-        Delete all messages for a session.
+    # ------------------------------------------------------------------ #
+    # Read-only properties                                                 #
+    # ------------------------------------------------------------------ #
 
-        Args:
-            session_id: Session to clear.
+    @property
+    def turn_count(self) -> int:
+        """Number of turns currently in the buffer."""
+        return len(self._buffer)
 
-        TODO:
-            - DEL key from Redis.
-        """
-        # TODO: implement
-        pass
+    @property
+    def total_tokens(self) -> int:
+        """Cumulative token count across all buffered turns."""
+        return self._total_tokens
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"ShortTermMemory("
+            f"turns={self.turn_count}/{self.max_turns}, "
+            f"tokens={self.total_tokens}/{self.max_tokens})"
+        )
