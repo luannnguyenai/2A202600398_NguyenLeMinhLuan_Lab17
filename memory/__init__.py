@@ -3,12 +3,12 @@ from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermProfileMemory
 from memory.episodic import EpisodicMemory
 from memory.semantic import SemanticMemory
-from memory.budget import MemoryBudgetManager
+from memory.budget import ContextBudget
 
 __all__ = [
     "ShortTermMemory",
     "LongTermProfileMemory",
     "EpisodicMemory",
     "SemanticMemory",
-    "MemoryBudgetManager",
+    "ContextBudget",
 ]

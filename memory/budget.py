@@ -1,156 +1,108 @@
 """
-memory/budget.py — Memory Budget Manager.
-
-Manages the token budget available for memory context so that the total
-prompt (system prompt + memory context + user message) stays within
-the model's context window.
-
-Uses tiktoken for accurate token counting.
+memory/budget.py — Memory Budget Manager with 4-level priority eviction.
 """
-
 from __future__ import annotations
 
-import os
+import enum
+import logging
+from dataclasses import dataclass
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
-class MemoryBudgetManager:
+try:
+    import tiktoken
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
+
+class Priority(enum.IntEnum):
     """
-    Manages token budget allocation across memory layers.
+    Priority levels for context eviction. Lower number = higher priority.
+    L1 is never evicted. L4 is evicted first.
+    """
+    L1_SYSTEM = 1
+    L2_PROFILE = 2
+    L3_RETRIEVAL = 3
+    L4_SHORT_TERM = 4
 
-    Attributes:
-        max_tokens:    Maximum total tokens allowed in the context window.
-        _encoding:     Lazy-initialised tiktoken encoding object.
-        _model_name:   Name of the model (used to select tiktoken encoding).
+@dataclass
+class Chunk:
+    """A unit of text to be packed into the context budget."""
+    content: str
+    priority: Priority
+    tokens: int
+    score: float = 0.0
+    source: str = ""
+
+class ContextBudget:
+    """
+    Manages token budget allocation across memory layers with priority eviction.
     """
 
-    def __init__(
-        self,
-        max_tokens: int | None = None,
-        model_name: str | None = None,
-    ) -> None:
-        """
-        Initialise the budget manager.
-
-        Args:
-            max_tokens:  Token budget. Defaults to MAX_CONTEXT_TOKENS env var.
-            model_name:  Model name for tiktoken encoding selection.
-                         Defaults to MODEL env var.
-        """
-        self.max_tokens = max_tokens or int(os.getenv("MAX_CONTEXT_TOKENS", "4000"))
-        self._model_name = model_name or os.getenv("MODEL", "gpt-4o-mini")
+    def __init__(self, max_tokens: int = 4000, model: str = "gpt-4o-mini") -> None:
+        self.max_tokens = max_tokens
+        self.model = model
         self._encoding = None
+        self._last_stats: dict[str, Any] = {"total_tokens": 0, "evicted": []}
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _get_encoding(self):
-        """
-        Return (and lazily initialise) the tiktoken encoding.
-
-        TODO:
-            - Import tiktoken.
-            - Use tiktoken.encoding_for_model(self._model_name) with fallback
-              to tiktoken.get_encoding("cl100k_base").
-        """
-        if self._encoding is None:
-            # TODO: initialise tiktoken encoding
-            pass
+    def _get_encoding(self) -> Any:
+        if self._encoding is None and HAS_TIKTOKEN:
+            try:
+                self._encoding = tiktoken.encoding_for_model(self.model)
+            except KeyError:
+                self._encoding = tiktoken.get_encoding("cl100k_base")
         return self._encoding
 
     def count_tokens(self, text: str) -> int:
+        """Count tokens using tiktoken, fallback to simple word count."""
+        encoding = self._get_encoding()
+        if encoding is not None:
+            return len(encoding.encode(text))
+        return max(1, len(text.split()))
+
+    def pack(self, chunks: list[Chunk]) -> list[Chunk]:
         """
-        Count the number of tokens in a given text string.
-
-        Args:
-            text: Input text.
-
-        Returns:
-            Token count as an integer.
-
-        TODO:
-            - Use self._get_encoding().encode(text) and return len().
+        Greedy packing of chunks into the token budget.
+        
+        Sorting: (priority ASC, score DESC).
+        L1 chunks are never evicted.
+        Logs warning if budget is near limit (>= 90%).
         """
-        # TODO: implement with tiktoken
-        # Rough estimate fallback: 4 chars ≈ 1 token
-        return max(1, len(text) // 4)
+        # Sort chunks: priority ascending (1 first), then score descending
+        sorted_chunks = sorted(chunks, key=lambda c: (c.priority, -c.score))
+        
+        packed = []
+        evicted = []
+        current_tokens = 0
+        
+        # Guard: L1 alone must fit
+        l1_tokens = sum(c.tokens for c in sorted_chunks if c.priority == Priority.L1_SYSTEM)
+        if l1_tokens > self.max_tokens:
+            raise ValueError(f"L1 SYSTEM chunks exceed budget: {l1_tokens} > {self.max_tokens}")
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        for chunk in sorted_chunks:
+            if current_tokens + chunk.tokens <= self.max_tokens:
+                packed.append(chunk)
+                current_tokens += chunk.tokens
+            else:
+                evicted.append({
+                    "priority": chunk.priority.name,
+                    "tokens": chunk.tokens,
+                    "reason": "Exceeded budget"
+                })
 
-    def compute_budget(self, user_message: str, system_overhead: int = 500) -> int:
-        """
-        Calculate available token budget for memory context.
+        # Warning when capacity >= 90%
+        if current_tokens >= self.max_tokens * 0.9:
+            logger.warning("context near limit, evicting L4 first")
 
-        Budget = max_tokens - system_overhead - count_tokens(user_message)
-
-        Args:
-            user_message:     The user's input text.
-            system_overhead:  Estimated tokens used by system prompt template.
-
-        Returns:
-            Available token count for memory context (minimum 0).
-
-        TODO:
-            - Use self.count_tokens() for accurate counting.
-        """
-        used = system_overhead + self.count_tokens(user_message)
-        return max(0, self.max_tokens - used)
-
-    def truncate_to_budget(self, text: str, budget: int) -> str:
-        """
-        Truncate `text` so that it fits within `budget` tokens.
-
-        Args:
-            text:   The text to truncate.
-            budget: Maximum allowed tokens.
-
-        Returns:
-            Truncated text string. May end mid-sentence; consider adding "...".
-
-        TODO:
-            - Encode text with tiktoken.
-            - Slice to budget tokens.
-            - Decode back to string.
-        """
-        # TODO: implement with tiktoken
-        # Rough fallback: 1 token ≈ 4 chars
-        max_chars = budget * 4
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars] + "..."
-
-    def allocate_per_layer(
-        self,
-        total_budget: int,
-        layer_weights: dict[str, float] | None = None,
-    ) -> dict[str, int]:
-        """
-        Distribute token budget across memory layers by weight.
-
-        Default weights: short_term=0.4, long_term=0.3, episodic=0.2, semantic=0.1
-
-        Args:
-            total_budget:  Total tokens available for memory context.
-            layer_weights: Optional override for per-layer proportions.
-                           Values should sum to 1.0.
-
-        Returns:
-            Dict mapping layer name → token count.
-
-        TODO:
-            - Normalise weights if they don't sum to 1.
-            - Distribute total_budget proportionally.
-            - Ensure integer values.
-        """
-        defaults = {
-            "short_term": 0.4,
-            "long_term": 0.3,
-            "episodic": 0.2,
-            "semantic": 0.1,
+        self._last_stats = {
+            "total_tokens": current_tokens,
+            "evicted": evicted
         }
-        weights = layer_weights or defaults
-        # TODO: implement proper allocation
-        return {layer: int(total_budget * w) for layer, w in weights.items()}
+        
+        return packed
+
+    def last_pack_stats(self) -> dict[str, Any]:
+        """Return stats from the last packing operation."""
+        return self._last_stats
