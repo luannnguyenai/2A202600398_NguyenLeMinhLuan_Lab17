@@ -1,197 +1,193 @@
 """
-benchmark/run_benchmark.py — CLI runner for the benchmark evaluation suite.
-
-Usage:
-    python benchmark/run_benchmark.py [--output results/benchmark_results.json]
-
-Steps:
-  1. Load all conversations from benchmark/conversations.py.
-  2. Build the LangGraph agent graph.
-  3. Replay each conversation turn-by-turn, measuring latency.
-  4. Score responses with benchmark/metrics.py.
-  5. Save results to JSON and print a Rich summary table.
+benchmark/run_benchmark.py
 """
-
-from __future__ import annotations
-
 import argparse
+import asyncio
 import json
 import os
-import time
-from datetime import datetime, timezone
+import shutil
 from pathlib import Path
 
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
-load_dotenv()
-
-from agent.graph import build_graph  # noqa: E402
-from benchmark.conversations import CONVERSATIONS  # noqa: E402
-from benchmark.metrics import (  # noqa: E402
-    ConversationResult,
-    TurnResult,
-    compute_metrics,
-    score_turn,
+from benchmark.conversations import load_conversations
+from benchmark.metrics import (
+    response_relevance,
+    context_utilization,
+    token_efficiency,
+    memory_hit_rate,
+    summarize,
 )
+from memory import ShortTermMemory, LongTermProfileMemory, EpisodicMemory, SemanticMemory, ContextBudget
+from agent.graph import build_graph, invoke_turn
 
 console = Console()
 
-DEFAULT_OUTPUT = Path(__file__).parent / "results" / "benchmark_results.json"
+def reset_data_dirs():
+    """Wipes out data directory to ensure a clean slate for memory backends."""
+    if Path("data").exists():
+        shutil.rmtree("data", ignore_errors=True)
+    if Path(".chroma").exists():
+        shutil.rmtree(".chroma", ignore_errors=True)
 
+async def run_scenario(conversations, mode: str, max_tokens: int):
+    results = []
+    for conv in conversations:
+        reset_data_dirs()
+        
+        # Ingest semantic if we are using memory
+        if mode == "with_memory":
+            import benchmark.ingest_mock as im
+            await im.ingest_test_corpus()
 
-def run_conversation(
-    graph,
-    conversation: dict,
-    session_prefix: str = "bench",
-) -> ConversationResult:
-    """
-    Replay a single conversation through the agent and collect results.
-
-    Args:
-        graph:          Compiled LangGraph graph.
-        conversation:   Conversation fixture dict from conversations.py.
-        session_prefix: Prefix for auto-generated session IDs.
-
-    Returns:
-        ConversationResult with per-turn scores.
-
-    TODO:
-        - Maintain session_id across turns (same session).
-        - Build initial_state for each turn.
-        - Measure wall-clock latency around graph.invoke().
-        - Call score_turn() and package into TurnResult.
-    """
-    session_id = f"{session_prefix}-{conversation['id']}"
-    result = ConversationResult(
-        conversation_id=conversation["id"],
-        conversation_name=conversation["name"],
-        tags=conversation["tags"],
-    )
-
-    for i, turn in enumerate(conversation["turns"]):
-        initial_state = {
-            "session_id": session_id,
-            "turn": i + 1,
-            "user_message": turn["user"],
-            "response": "",
-            "context": "",
-            "retrieved_from": [],
-            "memory_budget": 0,
-            "metadata": {},
+        memories = {
+            "short_term": ShortTermMemory(),
+            "long_term": LongTermProfileMemory(),
+            "episodic": EpisodicMemory(),
+            "semantic": SemanticMemory(),
+            "budget": ContextBudget(max_tokens=max_tokens)
         }
+        
+        graph = build_graph(memories)
+        user_id = f"user_{conv['id']}"
+        
+        final_res = None
+        for turn in conv["turns"]:
+            # If no-memory, we can wipe short-term before each turn if we want strict no memory,
+            # but usually short-term buffer is allowed in no-memory baseline.
+            # We'll just not use other memories for no_memory, but we can't easily disable them if graph is fixed.
+            # Instead, we can just clear everything for no_memory after every turn, or just mock them.
+            # Wait, the instruction says: "dùng 1 graph "naive" chỉ có short-term buffer... hoặc reset mỗi turn".
+            if mode == "no_memory":
+                await memories["long_term"].clear()
+                await memories["episodic"].clear()
+                # we let short term stay for conversational flow
+            
+            res = await invoke_turn(graph, memories, user_id, turn["text"])
+            final_res = res
+            
+        # Calc metrics on final turn
+        response = final_res["response"]
+        expected = conv.get("expected_contains", [])
+        expected_hit = conv.get("expected_memory_hit", [])
+        
+        rel = response_relevance(response, expected)
+        debug = final_res.get("debug", {})
+        debug["retrieved_from"] = final_res.get("retrieved_from", [])
+        util = context_utilization(debug)
+        
+        # To get prompt tokens accurately, we can extract from debug if available, else estimate
+        stats = debug.get("budget_stats", {})
+        prompt_tokens = stats.get("total_tokens", max_tokens)
+        
+        eff = token_efficiency(prompt_tokens, rel)
+        hit_rate = memory_hit_rate(debug["retrieved_from"], expected_hit)
+        
+        passed = (rel >= 1.0)
+        
+        results.append({
+            "id": conv["id"],
+            "group": conv["group"],
+            "passed": passed,
+            "metrics": {
+                "relevance": rel,
+                "utilization": util,
+                "efficiency": eff,
+                "hit_rate": hit_rate
+            },
+            "response": response
+        })
+        
+    return results
 
-        t0 = time.perf_counter()
-        try:
-            output = graph.invoke(initial_state)
-        except Exception as exc:  # noqa: BLE001
-            output = {"response": f"[ERROR] {exc}", "retrieved_from": []}
-        latency = time.perf_counter() - t0
+async def amain():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="gpt-4o-mini")
+    parser.add_argument("--budget", type=int, default=4000)
+    args = parser.parse_args()
 
-        response = output.get("response", "")
-        retrieved_from = output.get("retrieved_from", [])
-        hits, misses = score_turn(response, turn.get("expected_keywords", []))
+    os.environ["MODEL"] = args.model
+    
+    # Write a quick ingest mock for semantic
+    Path("benchmark/ingest_mock.py").write_text('''
+import asyncio
+from pathlib import Path
+from memory.semantic import SemanticMemory
+async def ingest_test_corpus():
+    Path("data/corpus").mkdir(parents=True, exist_ok=True)
+    Path("data/corpus/faq_docker.md").write_text("connect container using service name as hostname")
+    Path("data/corpus/faq_langgraph.md").write_text("StateGraph is the core class for multi-actor apps")
+    mem = SemanticMemory()
+    docs = [
+        {"id": "doc1", "text": "connect container using service name as hostname", "source": "faq_docker.md"},
+        {"id": "doc2", "text": "StateGraph is the core class for multi-actor apps", "source": "faq_langgraph.md"}
+    ]
+    await mem.ingest(docs)
+    ''')
 
-        result.turn_results.append(
-            TurnResult(
-                turn_index=i,
-                user_message=turn["user"],
-                response=response,
-                expected_keywords=turn.get("expected_keywords", []),
-                retrieved_from=retrieved_from,
-                latency_seconds=latency,
-                keyword_hits=hits,
-                keyword_misses=misses,
-            )
-        )
-
-    return result
-
-
-def print_summary_table(results: list[ConversationResult], metrics: dict) -> None:
-    """
-    Print a Rich table summarising benchmark results.
-
-    Args:
-        results: List of ConversationResult objects.
-        metrics: Aggregate metrics dict from compute_metrics().
-    """
-    table = Table(title="📊 Benchmark Results", show_lines=True)
-    table.add_column("Conversation", style="cyan", no_wrap=True)
-    table.add_column("Tags", style="dim")
-    table.add_column("Keyword Hit Rate", justify="right")
-    table.add_column("Exact Match Rate", justify="right")
-    table.add_column("Mean Latency (s)", justify="right")
-
-    for conv in results:
+    convs = load_conversations()
+    
+    console.print("[bold]Running NO-MEMORY baseline...[/bold]")
+    no_mem_results = await run_scenario(convs, "no_memory", args.budget)
+    
+    console.print("[bold]Running WITH-MEMORY agent...[/bold]")
+    with_mem_results = await run_scenario(convs, "with_memory", args.budget)
+    
+    Path("benchmark/results").mkdir(parents=True, exist_ok=True)
+    Path("benchmark/results/no_memory.json").write_text(json.dumps(no_mem_results, indent=2))
+    Path("benchmark/results/with_memory.json").write_text(json.dumps(with_mem_results, indent=2))
+    
+    no_mem_sum = summarize(no_mem_results)
+    with_mem_sum = summarize(with_mem_results)
+    
+    table = Table(title="Benchmark Results (No Memory vs With Memory)")
+    table.add_column("#")
+    table.add_column("Group")
+    table.add_column("Scenario")
+    table.add_column("No-Mem Pass")
+    table.add_column("With-Mem Pass")
+    table.add_column("Δ Relevance")
+    
+    for i, conv in enumerate(convs):
+        nm_res = next(r for r in no_mem_results if r["id"] == conv["id"])
+        wm_res = next(r for r in with_mem_results if r["id"] == conv["id"])
+        
+        nm_pass = "✅" if nm_res["passed"] else "❌"
+        wm_pass = "✅" if wm_res["passed"] else "❌"
+        d_rel = wm_res["metrics"]["relevance"] - nm_res["metrics"]["relevance"]
+        
         table.add_row(
-            conv.conversation_name,
-            ", ".join(conv.tags),
-            f"{conv.mean_keyword_hit_rate:.0%}",
-            f"{conv.exact_match_rate:.0%}",
-            f"{conv.mean_latency:.2f}s",
+            str(i+1),
+            conv["group"],
+            conv["id"],
+            nm_pass,
+            wm_pass,
+            f"{d_rel:+.2f}"
         )
-
+        
     console.print(table)
-    console.print(
-        f"\n[bold]Overall:[/bold] "
-        f"KHR={metrics.get('overall_keyword_hit_rate', 0):.0%}  "
-        f"EMR={metrics.get('overall_exact_match_rate', 0):.0%}  "
-        f"Latency={metrics.get('mean_latency_seconds', 0):.2f}s\n"
-    )
+    
+    # Generate BENCHMARK.md
+    md_content = f"""# Multi-Memory Agent Benchmark Report
 
+## Overall Metrics
+| Metric | No-Memory | With-Memory |
+|--------|-----------|-------------|
+| Pass Rate | {no_mem_sum['overall']['pass_rate']:.2%} | {with_mem_sum['overall']['pass_rate']:.2%} |
+| Relevance | {no_mem_sum['overall']['relevance']:.2f} | {with_mem_sum['overall']['relevance']:.2f} |
+| Hit Rate | {no_mem_sum['overall']['hit_rate']:.2f} | {with_mem_sum['overall']['hit_rate']:.2f} |
+| Efficiency | {no_mem_sum['overall']['efficiency']:.2f} | {with_mem_sum['overall']['efficiency']:.2f} |
 
-def main(output_path: Path = DEFAULT_OUTPUT) -> None:
-    """
-    Main entry point for the benchmark runner.
+## Scenario Details
+"""
+    for i, conv in enumerate(convs):
+        nm_res = next(r for r in no_mem_results if r["id"] == conv["id"])
+        wm_res = next(r for r in with_mem_results if r["id"] == conv["id"])
+        md_content += f"- **{conv['id']}** ({conv['group']}): No-Mem [{'PASS' if nm_res['passed'] else 'FAIL'}], With-Mem [{'PASS' if wm_res['passed'] else 'FAIL'}]\n"
 
-    TODO:
-        - Build graph.
-        - Run all conversations.
-        - Compute and print metrics.
-        - Save JSON results.
-    """
-    console.print("[bold cyan]Starting benchmark...[/bold cyan]")
-    graph = build_graph()
-
-    all_results: list[ConversationResult] = []
-    for conv in CONVERSATIONS:
-        console.print(f"  Running: [yellow]{conv['name']}[/yellow]")
-        result = run_conversation(graph, conv)
-        all_results.append(result)
-
-    metrics = compute_metrics(all_results)
-    print_summary_table(all_results, metrics)
-
-    # Save results
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "metrics": metrics,
-        "conversations": [
-            {
-                "id": r.conversation_id,
-                "name": r.conversation_name,
-                "tags": r.tags,
-                "mean_keyword_hit_rate": r.mean_keyword_hit_rate,
-                "exact_match_rate": r.exact_match_rate,
-                "mean_latency": r.mean_latency,
-            }
-            for r in all_results
-        ],
-    }
-    output_path.write_text(json.dumps(payload, indent=2))
-    console.print(f"[dim]Results saved to {output_path}[/dim]")
-
+    Path("BENCHMARK.md").write_text(md_content)
+    console.print("\n[bold green]Report saved to BENCHMARK.md[/bold green]")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Lab17 benchmark suite.")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Path to save JSON results.",
-    )
-    args = parser.parse_args()
-    main(output_path=args.output)
+    asyncio.run(amain())
